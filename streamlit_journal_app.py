@@ -1,353 +1,401 @@
-import streamlit as st
+import os
+import base64
+import hashlib
+import shutil
+from io import StringIO, BytesIO
+from pathlib import Path
+from datetime import datetime, date, time as dtime
+
 import pandas as pd
-import numpy as np
-from datetime import datetime, time
-import matplotlib.pyplot as plt
+import streamlit as st
+import streamlit_authenticator as stauth
+from filelock import FileLock
+from cryptography.fernet import Fernet
+import zipfile
 
-######## CONFIGURATION #########
-FOCUS_OPTIONS = [
-    ("Time Log", [
-        ("Name", "text", ""),
-        ("Time Range", "text", ""),
-        ("Energy", "select", ["Very Low", "Low", "Medium", "High", "Very High"]),
-        ("Focus Level", "select", ["Very Low", "Low", "Medium", "High", "Very High"]),
-        ("Notes", "text_area", "")
-    ]),
-    ("Expense Log", [
-        ("Items", "text", ""),
-        ("Category", "select", ["Food", "Transport", "Bills", "Health", "Fun", "Other"]),
-        ("Amount", "number", 0.0),
-        ("Emotion Before", "select", [
-            "😊 Happy", "😐 Okay", "😞 Sad", "😠 Angry", "😌 Calm", "🤩 Excited", "😔 Tired", "Other"
-        ]),
-        ("Emotion After", "select", [
-            "😊 Happy", "😐 Okay", "😞 Sad", "😠 Angry", "😌 Calm", "🤩 Excited", "😔 Tired", "Other"
-        ]),
-        ("Need vs Want (1-5)", "slider", (1, 5, 3)),
-        ("Notes", "text_area", "")
-    ]),
-    ("Stress Log", [
-        ("Trigger", "text", ""),
-        ("Stress (0-10)", "slider", (0, 10, 5)),
-        ("Negative Thought", "text_area", ""),
-        ("Reframe", "text_area", ""),
-        ("Mood After", "select", [
-            "😊 Happy", "😐 Okay", "😞 Sad", "😠 Angry", "😌 Calm", "🤩 Excited", "😔 Tired", "Other"
-        ])
-    ]),
-    ("Eating Log", [
-        ("Meal", "text", ""),
-        ("Food Items", "text_area", ""),
-        ("Hunger (0-10)", "slider", (0, 10, 5)),
-        ("Stress (0-10)", "slider", (0, 10, 5)),
-        ("Craving (0-10)", "slider", (0, 10, 5)),
-        ("Mood Before", "select", [
-            "😊 Happy", "😐 Okay", "😞 Sad", "😠 Angry", "😌 Calm", "🤩 Excited", "😔 Tired", "Other"
-        ]),
-        ("Mood After", "select", [
-            "😊 Happy", "😐 Okay", "😞 Sad", "😠 Angry", "😌 Calm", "🤩 Excited", "😔 Tired", "Other"
-        ]),
-        ("Notes", "text_area", "")
-    ])
+# --- Timezone support ---
+try:
+    from zoneinfo import ZoneInfo  # py>=3.9
+except Exception:
+    from pytz import timezone as ZoneInfo
+
+TZ = ZoneInfo("Europe/Athens")
+
+# ============================================================
+# 1) AUTHENTICATION
+# ============================================================
+credentials = st.secrets["credentials"]
+authenticator = stauth.Authenticate(
+    credentials,
+    cookie_name="journal_auth",
+    key="super_secret_key",   # change to any random string
+    cookie_expiry_days=7,
+)
+name, auth_status, username = authenticator.login("Login", "main")
+if auth_status is False:
+    st.error("Invalid credentials")
+    st.stop()
+elif auth_status is None:
+    st.stop()
+authenticator.logout("Logout", "sidebar")
+
+# ============================================================
+# 2) USER PATHS
+# ============================================================
+USER_DIR = os.path.join("data", username)
+os.makedirs(USER_DIR, exist_ok=True)
+
+USER_FILE = os.path.join(USER_DIR, "journal_entries.csv.enc")
+LOCK_FILE = USER_FILE + ".lock"
+
+ALL_COLUMNS = [
+    "date", "time_local", "datetime_iso",  # date, time, combined local ISO
+    "mood", "stress", "energy", "focus",
+    "notes", "tags"
 ]
 
-FOCUS_NAMES = [x[0] for x in FOCUS_OPTIONS]
-FOCUS_FIELDS = sorted(list(set([field for _, field_list in FOCUS_OPTIONS for field, *_ in field_list])))
-GENERAL_COLUMNS = ["DateTime", "Mood", "Focus"]
-ALL_COLUMNS = GENERAL_COLUMNS + FOCUS_FIELDS
+# ============================================================
+# 3) ENCRYPTION UTILITIES (Fernet: AES-128-CBC + HMAC)
+# ============================================================
+def derive_key(password: str) -> bytes:
+    digest = hashlib.sha256(password.encode()).digest()
+    return base64.urlsafe_b64encode(digest)
 
-def load_data():
-    try:
-        df = pd.read_csv("journal_entries.csv")
-        if "DateTime" not in df.columns and "Date" in df.columns:
-            df = df.rename(columns={"Date": "DateTime"})
-        df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
-        # Remove duplicated columns and fix order
-        cols_seen = set()
-        cols_unique = []
-        for c in ALL_COLUMNS:
-            if c not in cols_seen:
-                cols_unique.append(c)
-                cols_seen.add(c)
-        for col in cols_unique:
-            if col not in df.columns:
-                df[col] = ""
-        df = df[cols_unique]
-        return df
-    except FileNotFoundError:
-        return pd.DataFrame(columns=ALL_COLUMNS)
+def encrypt_csv(df: pd.DataFrame, password: str) -> bytes:
+    key = derive_key(password)
+    f = Fernet(key)
+    csv_data = df.to_csv(index=False).encode("utf-8")
+    return f.encrypt(csv_data)
 
-def save_data(df):
-    df.to_csv("journal_entries.csv", index=False)
+def decrypt_csv(enc_bytes: bytes, password: str) -> pd.DataFrame:
+    key = derive_key(password)
+    f = Fernet(key)
+    plain = f.decrypt(enc_bytes).decode("utf-8")
+    return pd.read_csv(StringIO(plain))
 
-def build_focus_fields(focus, session_key="", default_values=None):
-    results = {}
-    for option_focus, fields in FOCUS_OPTIONS:
-        if option_focus == focus:
-            for field_name, field_type, *args in fields:
-                key = f"{session_key}_{field_name}"
-                default = default_values.get(field_name, "") if default_values else None
-                if field_type == "text":
-                    results[field_name] = st.text_input(field_name, value=default or "")
-                elif field_type == "text_area":
-                    results[field_name] = st.text_area(field_name, value=default or "", height=60)
-                elif field_type == "select":
-                    options = args[0]
-                    idx = 0
-                    if default and default in options:
-                        idx = options.index(default)
-                    results[field_name] = st.selectbox(field_name, options, index=idx, key=key)
-                elif field_type == "slider":
-                    rng = args[0]
-                    val = int(default) if default not in [None, ""] else rng[2]
-                    results[field_name] = st.slider(field_name, rng[0], rng[1], val, key=key)
-                elif field_type == "number":
-                    results[field_name] = st.number_input(field_name, value=float(default) if default not in [None, ""] else args[0], key=key)
-            break
-    return results
+# ============================================================
+# 4) LOCKED + ENCRYPTED I/O
+# ============================================================
+def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for c in ALL_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    return df[ALL_COLUMNS]
 
-def add_entry(df, dt, mood, focus, focus_fields):
-    to_add = {col: "" for col in ALL_COLUMNS}
-    to_add["DateTime"] = pd.to_datetime(dt)
-    to_add["Mood"] = mood
-    to_add["Focus"] = focus
-    for k, v in focus_fields.items():
-        to_add[k] = v
-    df = pd.concat([df, pd.DataFrame([to_add])], ignore_index=True)
-    return df
+def load_data(path=USER_FILE) -> pd.DataFrame:
+    with FileLock(LOCK_FILE):
+        if not os.path.exists(path):
+            return pd.DataFrame(columns=ALL_COLUMNS)
 
-def edit_entry(df, idx, mood, focus, focus_fields):
-    df.at[idx, "Mood"] = mood
-    df.at[idx, "Focus"] = focus
-    for k, v in focus_fields.items():
-        df.at[idx, k] = v
-    return df
+        password = st.session_state.get("enc_key")
+        if not password:
+            password = st.text_input(
+                "🔑 Enter your encryption key to unlock your journal:",
+                type="password",
+                key="enter_key",
+            )
+            if not password:
+                st.stop()
+            st.session_state["enc_key"] = password
 
-def delete_entry(df, idx):
-    return df.drop(idx).reset_index(drop=True)
+        with open(path, "rb") as f:
+            enc = f.read()
+        try:
+            df = decrypt_csv(enc, st.session_state["enc_key"])
+        except Exception:
+            st.error("❌ Wrong key or corrupted file.")
+            st.stop()
 
-# Mood choices
-MOOD_CHOICES = [
-    "😊 Happy", "😐 Okay", "😞 Sad", "😠 Angry", 
-    "😌 Calm", "🤩 Excited", "😔 Tired", "Other"
-]
+        return _ensure_columns(df)
 
-st.set_page_config(page_title="Daily Journal", layout="centered")
-st.title("📔 My Daily Journal")
-df = load_data()
-if not df.empty and not pd.api.types.is_datetime64_any_dtype(df["DateTime"]):
-    df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
-
-tab1, tab2, tab3, tab4 = st.tabs(["New Entry", "My Journal", "Summaries", "Graphs"])
-
-### 1. NEW ENTRY ###
-with tab1:
-    st.subheader("Write a New Entry")
-    today = datetime.now()
-    entry_date = st.date_input("Date", today)
-    entry_time = st.time_input("Time", today.time())
-    entry_datetime = datetime.combine(entry_date, entry_time)
-    mood = st.selectbox("How do you feel today? (Pick one)", MOOD_CHOICES)
-    focus = st.selectbox("Focus", [x.title() for x in FOCUS_NAMES])
-    true_focus = " ".join(word.capitalize() for word in focus.split())
-    focus_fields = build_focus_fields(true_focus, session_key="new", default_values={})
-    if st.button("Save Entry", key="save_new"):
-        already = False
-        if not df.empty:
-            already = (df["DateTime"].dt.strftime("%Y-%m-%d %H:%M") == entry_datetime.strftime("%Y-%m-%d %H:%M")).any()
-        if already:
-            st.error(f"Entry for {entry_datetime.strftime('%Y-%m-%d %H:%M')} exists - edit it in 'My Journal'.")
-        else:
-            df = add_entry(df, entry_datetime, mood, true_focus, focus_fields)
-            save_data(df)
-            st.success("Entry saved! 🎉")
-            st.rerun()
-
-### 2. JOURNAL ###
-with tab2:
-    st.subheader("View & Manage Your Journal")
-    if df.empty:
-        st.info("No journal entries yet.")
-    else:
-        df = df.sort_values("DateTime", ascending=False).reset_index(drop=True)
-        date_options = df["DateTime"].dt.strftime("%Y-%m-%d %H:%M").tolist()
-        selected = st.selectbox("Select entry:", date_options, key="pick_date")
-        sel_index = df[df["DateTime"].dt.strftime("%Y-%m-%d %H:%M") == selected].index[0]
-        st.write(f"**Date & Time:** {df.at[sel_index, 'DateTime'].strftime('%Y-%m-%d %H:%M')}")
-        st.write(f"**Mood:** {df.at[sel_index, 'Mood']}")
-        st.write(f"**Focus:** {df.at[sel_index, 'Focus']}")
-        st.markdown("#### Entry Details:")
-        this_focus = df.at[sel_index, "Focus"]
-        fields = [f for f in FOCUS_OPTIONS if f[0] == this_focus]
-        if fields:
-            for field_name, _, *_ in fields[0][1]:
-                value = df.at[sel_index, field_name]
-                st.write(f"**{field_name}:** {value}")
-        st.markdown("---")
-        with st.expander("✏️ Edit this entry"):
-            edit_mood = st.selectbox("Edit Mood", MOOD_CHOICES, index=MOOD_CHOICES.index(df.at[sel_index, "Mood"]), key=f"edit_mood_{sel_index}")
-            edit_focus = st.selectbox("Edit Focus", [x.title() for x in FOCUS_NAMES], index=FOCUS_NAMES.index(this_focus), key=f"edit_focus_{sel_index}")
-            edit_focus = " ".join(word.capitalize() for word in edit_focus.split())
-            defaults = {field: df.at[sel_index, field] for _, fields in FOCUS_OPTIONS if _ == edit_focus for field, *_ in fields}
-            edit_fields = build_focus_fields(edit_focus, session_key=f"edit_{sel_index}", default_values=defaults)
-            if st.button("Save changes", key=f'edit_btn_{sel_index}'):
-                df = edit_entry(df, sel_index, edit_mood, edit_focus, edit_fields)
-                save_data(df)
-                st.success("Entry updated!")
-                st.rerun()
-        if st.button("❌ Delete this entry", key=f'del_{sel_index}'):
-            df = delete_entry(df, sel_index)
-            save_data(df)
-            st.warning("Entry deleted.")
-            st.rerun()
-        st.markdown("### Journal Timeline")
-        timeline = df[["DateTime", "Mood", "Focus"]].copy()
-        timeline_display = timeline.rename(
-            columns={"DateTime": "Date & Time", "Mood": "Mood", "Focus": "Focus"}
+def save_data(df: pd.DataFrame, path=USER_FILE):
+    password = st.session_state.get("enc_key")
+    if not password:
+        password = st.text_input(
+            "Set your encryption key:",
+            type="password",
+            key="set_key",
         )
-        timeline_display["Date & Time"] = timeline_display["Date & Time"].dt.strftime("%Y-%m-%d %H:%M")
-        st.dataframe(timeline_display, use_container_width=True, hide_index=True)
+        if not password:
+            st.warning("Enter a key to save securely.")
+            st.stop()
+        st.session_state["enc_key"] = password
 
-### 3. SUMMARIES TAB ###
-with tab3:
-    st.subheader("Journal Summaries")
-    period_type = st.selectbox(
-        "Summary Period",
-        ["Day", "Week", "Month", "Quarter", "Semester", "Year"],
-        key="sel_period"
+    enc = encrypt_csv(df, password)
+    with FileLock(LOCK_FILE):
+        with open(path, "wb") as f:
+            f.write(enc)
+
+# ============================================================
+# 5) CHANGE / RESET ENCRYPTION KEY
+# ============================================================
+def change_encryption_key():
+    if not os.path.exists(USER_FILE):
+        st.warning("No journal file to re-encrypt yet.")
+        return
+    old_key = st.text_input("Current encryption key", type="password", key="old_key")
+    new_key = st.text_input("New encryption key", type="password", key="new_key")
+    confirm = st.text_input("Confirm new encryption key", type="password", key="confirm_key")
+
+    if st.button("🔄 Re-encrypt with new key"):
+        if new_key != confirm:
+            st.error("New keys do not match.")
+            return
+        try:
+            with FileLock(LOCK_FILE):
+                enc_bytes = open(USER_FILE, "rb").read()
+                df = decrypt_csv(enc_bytes, old_key)
+                new_enc = encrypt_csv(df, new_key)
+                open(USER_FILE, "wb").write(new_enc)
+            st.session_state["enc_key"] = new_key
+            st.success("✅ File re-encrypted with your new key.")
+        except Exception:
+            st.error("❌ Incorrect old key or decryption failed.")
+
+# ============================================================
+# 6) BACKUPS: daily auto + manual + restore
+# ============================================================
+BACKUP_DIR = Path(USER_DIR) / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+RETENTION_DAYS = 14
+
+def backup_filename_for_today() -> Path:
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    return BACKUP_DIR / f"journal_entries_{today}.csv.enc"
+
+def list_backups():
+    return sorted(BACKUP_DIR.glob("journal_entries_*.csv.enc"))
+
+def latest_backup():
+    files = list_backups()
+    return files[-1] if files else None
+
+def create_backup_now():
+    if not os.path.exists(USER_FILE):
+        return False
+    dest = backup_filename_for_today()
+    if dest.exists():
+        return True
+    with FileLock(LOCK_FILE):
+        shutil.copy2(USER_FILE, dest)
+    return True
+
+def enforce_retention():
+    # keep only the most recent RETENTION_DAYS backups
+    files = list_backups()
+    if len(files) <= RETENTION_DAYS:
+        return
+    to_delete = files[0 : len(files) - RETENTION_DAYS]
+    for f in to_delete:
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+def ensure_backup_today():
+    try:
+        if create_backup_now():
+            enforce_retention()
+    except Exception:
+        st.warning("Automatic backup attempt failed.")
+
+# ============================================================
+# 7) FORM STATE: always blank when returning to New Entry tab
+# ============================================================
+ENTRY_KEYS = [
+    "entry_date", "entry_time", "entry_mood", "entry_stress",
+    "entry_energy", "entry_focus", "entry_notes", "entry_tags"
+]
+
+def reset_entry_form():
+    # Defaults: date=today local, time=now local, others blank/neutral
+    now = datetime.now(TZ)
+    st.session_state["entry_date"] = date.fromtimestamp(now.timestamp())
+    st.session_state["entry_time"] = dtime(hour=now.hour, minute=now.minute, second=0)
+    st.session_state["entry_mood"] = ""
+    st.session_state["entry_stress"] = 5
+    st.session_state["entry_energy"] = 5
+    st.session_state["entry_focus"] = 5
+    st.session_state["entry_notes"] = ""
+    st.session_state["entry_tags"] = ""
+
+def ensure_entry_defaults():
+    for k in ENTRY_KEYS:
+        if k not in st.session_state:
+            reset_entry_form()
+            break
+
+# Track active tab to clear when user returns to "New Entry"
+if "active_tab" not in st.session_state:
+    st.session_state["active_tab"] = "New Entry"
+
+def on_tab_change(tab_name: str):
+    prev = st.session_state.get("active_tab")
+    st.session_state["active_tab"] = tab_name
+    if tab_name == "New Entry" and prev != "New Entry":
+        reset_entry_form()  # blank form every time you come back
+
+# ============================================================
+# 8) APP UI
+# ============================================================
+st.title(f"🔒 Secure Journal — {name}")
+
+# Do a daily backup early
+ensure_backup_today()
+
+st.sidebar.header("Security & Backups")
+if st.sidebar.button("Change / Reset Encryption Key"):
+    st.session_state["show_key_change"] = True
+if st.session_state.get("show_key_change"):
+    change_encryption_key()
+
+with st.sidebar.expander("Backups"):
+    if st.button("📦 Backup now"):
+        ok = create_backup_now()
+        st.success("Backup created (encrypted).") if ok else st.warning("Nothing to back up yet.")
+    lb = latest_backup()
+    if lb and lb.exists():
+        with open(lb, "rb") as f:
+            st.download_button(
+                label=f"⬇️ Download latest backup ({lb.name})",
+                data=f.read(),
+                file_name=lb.name,
+                mime="application/octet-stream",
+                key="dl_latest_backup",
+            )
+    backups = list_backups()
+    if backups:
+        names = [b.name for b in backups]
+        choice = st.selectbox("Restore from backup:", names, key="restore_choice")
+        if st.button("Restore selected backup"):
+            chosen = BACKUP_DIR / st.session_state["restore_choice"]
+            try:
+                with FileLock(LOCK_FILE):
+                    shutil.copy2(chosen, USER_FILE)
+                st.success("Restored. Reload app and unlock with your key.")
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+    else:
+        st.caption("No backups available yet.")
+
+# Load data after security/backups are rendered
+df = load_data()
+
+# Tabs
+tabs = st.tabs(["New Entry", "Entries", "Download"])
+# Handle tab changes (Streamlit doesn't provide a direct callback; emulate with radio-like tracking)
+# We'll simply call on_tab_change inside each tab's block.
+
+# --- New Entry Tab ---
+with tabs[0]:
+    on_tab_change("New Entry")
+    ensure_entry_defaults()
+
+    st.subheader("New Journal Entry (Europe/Athens time)")
+    with st.form("entry_form", clear_on_submit=True):
+        # Use local defaults from session_state; always reset on tab return
+        col1, col2 = st.columns(2)
+        with col1:
+            entry_date = st.date_input("Date", key="entry_date")
+            entry_mood = st.text_input("Mood", key="entry_mood", placeholder="e.g., calm, anxious")
+            entry_energy = st.slider("Energy (0–10)", 0, 10, key="entry_energy")
+            entry_focus = st.slider("Focus (0–10)", 0, 10, key="entry_focus")
+        with col2:
+            entry_time = st.time_input("Time (local)", key="entry_time")
+            entry_stress = st.slider("Stress (0–10)", 0, 10, key="entry_stress")
+            entry_tags = st.text_input("Tags (comma-separated)", key="entry_tags")
+        entry_notes = st.text_area("Notes", key="entry_notes")
+
+        submitted = st.form_submit_button("Add Entry")
+
+    if submitted:
+        # Combine date + time into local timezone ISO string
+        try:
+            local_dt = datetime.combine(entry_date, entry_time, tzinfo=TZ)
+        except TypeError:
+            # For Python <3.11, tzinfo parameter might not be applied directly; fallback:
+            naive = datetime.combine(entry_date, entry_time)
+            local_dt = naive.replace(tzinfo=TZ)
+
+        new_row = {
+            "date": entry_date.isoformat(),
+            "time_local": local_dt.strftime("%H:%M:%S"),
+            "datetime_iso": local_dt.isoformat(),
+            "mood": entry_mood,
+            "stress": entry_stress,
+            "energy": entry_energy,
+            "focus": entry_focus,
+            "notes": entry_notes,
+            "tags": entry_tags,
+        }
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        save_data(df)
+        ensure_backup_today()  # if first save of the day, create a backup
+        st.success("Entry saved securely!")
+        # After save, blank the form (even if user stays on this tab)
+        reset_entry_form()
+
+# --- Entries Tab ---
+with tabs[1]:
+    on_tab_change("Entries")
+    st.subheader("Your Journal Entries (times shown in Europe/Athens)")
+    st.dataframe(df)
+
+# --- Download Tab ---
+with tabs[2]:
+    on_tab_change("Download")
+    st.subheader("Download Options")
+    # 1) Decrypted CSV
+    decrypted_csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download Decrypted CSV",
+        data=decrypted_csv_bytes,
+        file_name="journal_entries.csv",
+        mime="text/csv",
+        key="dl_plain_csv",
     )
-    if period_type == "Day":
-        summary_date = st.date_input("Date for summary", datetime.now().date(), key="summary_date")
-        mask = (df["DateTime"].dt.date == summary_date)
-    elif period_type == "Week":
-        week_start = st.date_input("Week start", datetime.now().date(), key="week_start")
-        week_end = week_start + pd.Timedelta(days=6)
-        mask = (df["DateTime"].dt.date >= week_start) & (df["DateTime"].dt.date <= week_end)
-    elif period_type == "Month":
-        years = sorted(df["DateTime"].dt.year.dropna().unique())
-        if not years: years = [datetime.now().year]
-        yr = st.selectbox("Year", years, key="mo_y")
-        mo = st.selectbox("Month", list(range(1,13)), format_func=lambda x: datetime(2000, x, 1).strftime("%B"), key="mo_mo")
-        first = datetime(yr, mo, 1)
-        last = (first + pd.offsets.MonthEnd(1)).date()
-        mask = (df["DateTime"].dt.date >= first.date()) & (df["DateTime"].dt.date <= last)
-    elif period_type == "Quarter":
-        years = sorted(df["DateTime"].dt.year.dropna().unique())
-        if not years: years = [datetime.now().year]
-        yr = st.selectbox("Year", years, key="q_y")
-        q = st.selectbox("Quarter", [1,2,3,4], key="q_q")
-        q_month = (q-1)*3+1
-        first = datetime(yr, q_month, 1)
-        last = (first + pd.offsets.MonthEnd(3)).date()
-        mask = (df["DateTime"].dt.date >= first.date()) & (df["DateTime"].dt.date <= last)
-    elif period_type == "Semester":
-        years = sorted(df["DateTime"].dt.year.dropna().unique())
-        if not years: years = [datetime.now().year]
-        yr = st.selectbox("Year", years, key="s_y")
-        sem = st.selectbox("Semester", [1,2], key="s_s")
-        start_month = 1 if sem == 1 else 7
-        first = datetime(yr, start_month, 1)
-        last = (first + pd.offsets.MonthEnd(6)).date()
-        mask = (df["DateTime"].dt.date >= first.date()) & (df["DateTime"].dt.date <= last)
-    elif period_type == "Year":
-        years = sorted(df["DateTime"].dt.year.dropna().unique())
-        if not years: years = [datetime.now().year]
-        yr = st.selectbox("Year", years, key="y_y")
-        first = datetime(yr, 1, 1)
-        last = datetime(yr, 12, 31)
-        mask = (df["DateTime"].dt.date >= first.date()) & (df["DateTime"].dt.date <= last.date())
-    else:
-        mask = pd.Series([False]*len(df))
-    dfp = df[mask].copy()
-    df_exp = dfp[dfp["Focus"] == "Expense Log"]
-    with st.container():
-        total_eur = pd.to_numeric(df_exp["Amount"], errors="coerce").sum()
-        st.metric("Total EUR (Expenses)", f"{total_eur:.2f} €")
-    df_stress = dfp[dfp["Focus"].isin(["Stress Log", "Eating Log"])]
-    stress_vals = []
-    if "Stress (0-10)" in df_stress.columns:
-        stress_vals += pd.to_numeric(df_stress["Stress (0-10)"], errors="coerce").dropna().tolist()
-    avg_stress = np.nan
-    if stress_vals:
-        avg_stress = np.mean(stress_vals)
-    st.metric("Average Stress", "-" if np.isnan(avg_stress) else f"{avg_stress:.2f} / 10")
-    df_eating = dfp[dfp["Focus"] == "Eating Log"]
-    meals_count = df_eating["Meal"].dropna().apply(lambda x: str(x).strip() != "").sum()
-    st.metric("Meal Entries", meals_count)
-    avg_craving = pd.to_numeric(df_eating["Craving (0-10)"], errors="coerce").mean(skipna=True)
-    st.metric("Average Craving", "-" if np.isnan(avg_craving) else f"{avg_craving:.2f} / 10")
-    df_time = dfp[dfp["Focus"] == "Time Log"]
-    energy_map = {"Very Low":1, "Low":2, "Medium":3, "High":4, "Very High":5}
-    if not df_time.empty and "Energy" in df_time.columns:
-        energies = df_time["Energy"].map(energy_map)
-        avg_energy = energies.mean(skipna=True)
-        avg_energy_str = "-" if np.isnan(avg_energy) else f"{avg_energy:.2f} / 5"
-    else:
-        avg_energy_str = "-"
-    st.metric("Average Energy", avg_energy_str)
 
-### 4. GRAPHS TAB ###
-with tab4:
-    st.subheader("Trends & Visualizations")
-    log_types = ["Time Log", "Expense Log", "Stress Log", "Eating Log"]
-    selected_logs = st.multiselect(
-        "Select which logs to show graphs for:", 
-        options=log_types, 
-        default=log_types
+    # 1b) Decrypted CSV as ZIP
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("journal_entries.csv", decrypted_csv_bytes)
+    zip_buf.seek(0)
+    st.download_button(
+        label="⬇️ Download Decrypted CSV (ZIP)",
+        data=zip_buf,
+        file_name="journal_entries.zip",
+        mime="application/zip",
+        key="dl_plain_zip",
     )
-    df_vis = df[df["Focus"].isin(selected_logs)].copy()
-    if df_vis.empty:
-        st.info("No data for selected logs and period.")
-    else:
-        df_vis["Date"] = df_vis["DateTime"].dt.date
 
-        # EXPENSE LOG: Expenses Over Time
-        if "Expense Log" in selected_logs:
-            df_exp = df_vis[df_vis["Focus"] == "Expense Log"].copy()
-            if not df_exp.empty:
-                df_exp["Amount"] = pd.to_numeric(df_exp["Amount"], errors="coerce")
-                by_date = df_exp.groupby("Date")["Amount"].sum()
-                st.markdown("#### Expenses Over Time (€)")
-                st.bar_chart(by_date)
+    # 2) Encrypted file (.csv.enc)
+    try:
+        with open(USER_FILE, "rb") as f:
+            enc_bytes = f.read()
+        st.download_button(
+            label="⬇️ Download Encrypted File (.csv.enc)",
+            data=enc_bytes,
+            file_name="journal_entries.csv.enc",
+            mime="application/octet-stream",
+            key="dl_encrypted",
+        )
+    except FileNotFoundError:
+        st.info("No encrypted file found yet. Save an entry first.")
 
-        # STRESS LOG & EATING LOG: Stress Over Time
-        plot_stress_types = []
-        if "Stress Log" in selected_logs:
-            plot_stress_types.append("Stress Log")
-        if "Eating Log" in selected_logs:
-            plot_stress_types.append("Eating Log")
-        if plot_stress_types:
-            df_stress = df_vis[df_vis["Focus"].isin(plot_stress_types)].copy()
-            df_stress["Stress (0-10)"] = pd.to_numeric(df_stress["Stress (0-10)"], errors="coerce")
-            if not df_stress.empty:
-                st.markdown(f"#### Stress Over Time ({' & '.join(plot_stress_types)})")
-                stress_by_date = df_stress.groupby(["Date", "Focus"])["Stress (0-10)"].mean().unstack()
-                st.line_chart(stress_by_date)
+    # Checksums
+    def sha256_hex(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
 
-        # EATING LOG: Craving Over Time
-        if "Eating Log" in selected_logs:
-            df_eat = df_vis[df_vis["Focus"] == "Eating Log"].copy()
-            if not df_eat.empty:
-                df_eat["Craving (0-10)"] = pd.to_numeric(df_eat["Craving (0-10)"], errors="coerce")
-                craving_by_date = df_eat.groupby("Date")["Craving (0-10)"].mean()
-                st.markdown("#### Craving Over Time (Eating Log)")
-                st.line_chart(craving_by_date)
-                # Meals per day
-                meals_by_date = df_eat["Meal"].dropna().groupby(df_eat["Date"]).count()
-                st.markdown("#### Number of Meals Over Time")
-                st.bar_chart(meals_by_date)
+    colA, colB = st.columns(2)
+    with colA:
+        st.caption("SHA-256 (decrypted CSV)")
+        st.code(sha256_hex(decrypted_csv_bytes), language="text")
+    with colB:
+        st.caption("SHA-256 (encrypted .csv.enc)")
+        if "enc_bytes" in locals():
+            st.code(sha256_hex(enc_bytes), language="text")
+        else:
+            st.text("—")
 
-        # TIME LOG: Energy Over Time
-        if "Time Log" in selected_logs:
-            df_t = df_vis[df_vis["Focus"] == "Time Log"].copy()
-            if not df_t.empty:
-                energy_map = {"Very Low":1, "Low":2, "Medium":3, "High":4, "Very High":5}
-                df_t["Energy Num"] = df_t["Energy"].map(energy_map)
-                energy_by_date = df_t.groupby("Date")["Energy Num"].mean()
-                st.markdown("#### Average Energy Over Time (Time Log, 1=Very Low...5=Very High)")
-                st.line_chart(energy_by_date)
-
-        st.info("Plots show daily metrics based on selected log types.")
-
-st.markdown("---")
-st.caption("Your journal data is stored only on your local device (journal_entries.csv).")
+# Footer info
+st.caption("Times are saved and displayed in Europe/Athens timezone.")
